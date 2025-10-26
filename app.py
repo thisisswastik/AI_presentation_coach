@@ -1,0 +1,440 @@
+import requests
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from typing import List, Dict, Any, Optional
+from pydantic import BaseModel, Field
+from io import BytesIO
+import whisper 
+import torch
+import pyttsx3 
+from enum import Enum
+
+# IMPORT FIX: Explicitly import the analysis module to allow access to its globals (analysis.client)
+import analysis
+from analysis import (
+    call_whisper_api, _simulate_whisper_output, detect_fillers, 
+    analyze_pacing, calculate_clarity_score, get_llm_rewrite,
+    analyze_vague_language, analyze_topic_relevance, analyze_pauses, 
+    simulate_acoustic_metrics, TARGET_WPM_RANGE,_get_gemini_client,
+    get_llm_presentation_script, get_llm_presentation_content, analyze_script_redundancy # <--- NEW IMPORT
+)
+
+# --- Pydantic Response Models ---
+
+class TranscriptSegment(BaseModel):
+    text: str
+    start: float
+    end: float
+    tags: List[str]
+
+class AcousticMetrics(BaseModel):
+    avg_volume_status: str
+    pitch_monotony_score: float
+
+class FullEvaluationResponse(BaseModel):
+    # Core Delivery Metrics
+    clarity_score: int
+    overall_wpm: float
+    filler_count: int
+    strategic_pauses: int
+    hesitation_gaps: int
+    acoustic_metrics: AcousticMetrics
+    
+    # Content & Vague Language Metrics
+    relevance_score: Optional[int] = None # Optional/None if topic is not provided
+    suggested_content: List[str] = []
+    vague_phrases_found: List[str]
+    
+    # Output
+    raw_transcription: str
+    feedback: List[str]
+    transcript: List[TranscriptSegment]
+
+class ContentAnalysisResponse(BaseModel):
+    relevance_score: Optional[int]
+    suggested_content: List[str]
+
+# MODEL 1: For the speech generation endpoint
+class SpeechDraftResponse(BaseModel):
+    topic: str
+    time_limit_minutes: float
+    estimated_word_count: int
+    generated_speech_draft: str
+    # New: tone used for generation
+    tone: str
+    
+# MODEL 2: For the AI voiceover script endpoint
+class AIVoiceoverResponse(BaseModel):
+    topic: str
+    time_limit_minutes: float
+    estimated_word_count: int
+    full_voiceover_script: str
+    # New field to confirm audio generation
+    audio_file_saved_as: str 
+    
+# NEW MODEL 3: For the presentation content endpoint
+class PresentationSlide(BaseModel):
+    slide_title: str
+    main_points: List[str]
+    visual_suggestion: str
+
+class PresentationContentResponse(BaseModel):
+    template_suggestion: str
+    topic: str
+    time_limit_minutes: int
+    estimated_word_count: int
+    slides: List[PresentationSlide]
+
+class RedundancyAnalysisResponse(BaseModel):
+    redundancy_score: int = Field(..., description="Redundancy score from 0 (Low) to 100 (High).")
+    analysis_tip: str = Field(..., description="Actionable tip based on the score.")
+    redundant_phrases_found: List[str] = Field(..., description="Specific phrases from the script that overlap with slide content.")
+    slide_content_provided: List[str]
+    
+# --- FastAPI Initialization (CRITICAL: Must be defined as 'app') ---
+app = FastAPI(
+    title="Presentation Coach API",
+    description="Backend API for speech analysis and LLM-powered content critique.",
+    version="1.3.1" # Updated version number
+)
+
+class TimeLimit(Enum):
+    one_min = 1.0
+    two_min = 2.0
+    three_min = 3.0
+    four_min = 4.0
+    five_min = 5.0
+    thirty_seconds = 0.5   # 0.5 minutes == 30 seconds
+
+ALLOWED_TIME_LIMITS = {float(t.value) for t in TimeLimit}
+
+# Tone options for dropdown in the OpenAPI UI
+class Tone(Enum):
+    persuasive = "Persuasive / Convincing"
+    informative = "Informative / Educational"
+    motivational = "Motivational / Inspirational"
+    empathic = "Empathic / Customer-Facing"
+    formal = "Formal / Authoritative"
+    casual = "Casual / Conversational"
+
+def generate_core_feedback(overall_wpm, filler_count, total_words, tagged_list, acoustic_metrics, pause_metrics, vague_phrases, relevance_score, suggested_content):
+    """Generates actionable feedback based on ALL metrics (Delivery & Content)."""
+    
+    feedback = []
+    target_range = analysis.TARGET_WPM_RANGE
+    
+    # FIX: Extract pause metrics from the dictionary
+    strategic_pauses = pause_metrics['strategic']
+    hesitation_gaps = pause_metrics['hesitation']
+    # END FIX
+
+    # 1. Delivery Feedback (Pacing, Fillers, Pauses)
+    if overall_wpm > target_range[1]:
+        feedback.append(f"⚠️ Pacing Alert: You spoke too fast ({round(overall_wpm)} WPM). Slow down.")
+    elif overall_wpm < target_range[0]:
+        feedback.append(f"⚠️ Pacing Alert: You spoke too slowly ({round(overall_wpm)} WPM). Increase energy.")
+    else:
+        feedback.append(f"✅ Pacing: Your overall speed ({round(overall_wpm)} WPM) is within range.")
+
+    filler_rate = (filler_count / total_words) * 100 if total_words > 0 else 0
+    if filler_rate > 2.0:
+        feedback.append(f"🛑 Filler Warning: Used {filler_count} filler words ({round(filler_rate, 1)}%). Replace with pauses.")
+    
+    # 2. Pause Analysis Feedback (FIX APPLIED HERE)
+    if strategic_pauses > 0:
+        feedback.append(f"⭐ Pause Success: Found {strategic_pauses} strategic pauses. Use these more!")
+    if hesitation_gaps > 0:
+        feedback.append(f"🚨 Hesitation Warning: Detected {hesitation_gaps} hesitation gaps. Practice smooth transitions.")
+
+    monotony = acoustic_metrics.pitch_monotony_score
+    if monotony > 75:
+        feedback.append(f"🛑 Monotony Alert: Your delivery is flat (Score {monotony}/100). Vary your tone and pitch.")
+    if acoustic_metrics.avg_volume_status == "Quiet":
+        feedback.append(f"📢 Volume Alert: Your volume was too quiet in sections. Project more.")
+        
+    if vague_phrases and isinstance(vague_phrases, list) and vague_phrases[0] != "Vague language analysis failed due to API error.":
+         feedback.append(f"📉 Vague Language: Found {len(vague_phrases)} instances of vague words (e.g., '{vague_phrases[0]}'). Be precise.")
+
+    # 3. LLM Rewriting Logic (Same as before)
+    llm_rewrites = []
+    filler_word_indices = [i for i, word in enumerate(tagged_list) if "filler" in word["tags"]]
+    analyzed_indices = set()
+    
+    for i in filler_word_indices:
+        if i not in analyzed_indices and len(llm_rewrites) < 3:
+            start_index = max(0, i - 2)
+            end_index = min(len(tagged_list), i + 3)
+            segment_words = tagged_list[start_index:end_index]
+            original_phrase = " ".join([w["text"] for w in segment_words])
+            
+            for j in range(start_index, end_index): analyzed_indices.add(j)
+                
+            rewrite = get_llm_rewrite(original_phrase)
+            
+            llm_rewrites.append(f"Original: \"{original_phrase.capitalize()}...\" -> Improvement: \"{rewrite.capitalize()}\"")
+
+    if llm_rewrites:
+        feedback.append("🧠 LLM Phrase Suggestions:")
+        feedback.extend(llm_rewrites)
+        
+    # 4. Content Relevance Feedback (NEW MERGED LOGIC)
+    if relevance_score is not None:
+        feedback.append(f"\n🧠 **Content Relevance Score**: {relevance_score}/10")
+        if relevance_score < 7:
+            feedback.append("🛑 **Content Warning**: Your presentation may lack focus on the core topic. Review your structure.")
+            
+    if suggested_content and isinstance(suggested_content, list) and len(suggested_content) > 0 and suggested_content[0] != "Content analysis failed due to API error.":
+        feedback.append("\n📚 **Recommended Content to Add**")
+        for item in suggested_content:
+            feedback.append(f"   - {item}")
+            
+    return feedback
+
+
+# --- ENDPOINT 1 (MERGED): /analyze (Full Delivery and Content Analysis) ---
+@app.post("/analyze", response_model=FullEvaluationResponse, summary="Performs full analysis: Pacing, Fillers, Clarity, and (optionally) Topic Relevance.")
+async def analyze_presentation(
+    audio_file: UploadFile = File(..., description="Audio file (WAV format recommended)."),
+    topic: Optional[str] = Form(None, description="Optional: Topic for content relevance check.")
+):
+    
+    try:
+        audio_bytes = await audio_file.read()
+        
+        # 1. Transcription
+        raw_text = call_whisper_api(audio_bytes)
+        if not raw_text:
+            raise HTTPException(status_code=400, detail="Transcription failed to produce text.")
+        
+        # 2. Core Analysis Pipeline
+        word_list_data = analysis._simulate_whisper_output(raw_text)
+        total_words = len(word_list_data)
+
+        word_list_data, filler_count = analysis.detect_fillers(word_list_data)
+        word_list_data, overall_wpm, wpm_map = analysis.analyze_pacing(word_list_data)
+        word_list_data, strategic_pauses, hesitation_gaps = analysis.analyze_pauses(word_list_data)
+        vague_phrases = analysis.analyze_vague_language(raw_text)
+        
+        acoustic_metrics_dict = analysis.simulate_acoustic_metrics(wpm_map)
+        acoustic_metrics = AcousticMetrics(**acoustic_metrics_dict)
+        
+        clarity_score = analysis.calculate_clarity_score(overall_wpm, filler_count, total_words, acoustic_metrics_dict)
+        
+        # 3. Content Analysis (CONDITIONAL)
+        relevance_score = None
+        suggested_content = []
+        
+        if topic and topic.strip():
+            relevance_score, suggested_content = analysis.analyze_topic_relevance(raw_text, topic)
+
+        # 4. Feedback Generation
+        pause_metrics = {'strategic': strategic_pauses, 'hesitation': hesitation_gaps}
+        feedback_list = generate_core_feedback(
+            overall_wpm, filler_count, total_words, word_list_data, 
+            acoustic_metrics, pause_metrics, vague_phrases,
+            relevance_score, suggested_content
+        )
+
+        # 5. Return Results
+        return FullEvaluationResponse(
+            clarity_score=clarity_score,
+            overall_wpm=round(overall_wpm, 1),
+            filler_count=filler_count,
+            strategic_pauses=strategic_pauses,
+            hesitation_gaps=hesitation_gaps,
+            vague_phrases_found=vague_phrases,
+            acoustic_metrics=acoustic_metrics,
+            relevance_score=relevance_score,
+            suggested_content=suggested_content,
+            raw_transcription=raw_text,
+            transcript=word_list_data
+        )
+
+    except requests.exceptions.HTTPError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=f"Whisper API error: {e.response.text}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal Server Error during analysis: {e}")
+
+
+# --- ENDPOINT 2: /speech_draft (Draft Generation) ---
+@app.post("/speech_draft", response_model=SpeechDraftResponse, summary="Generates a professional speech draft based on topic and time limit.")
+async def speech_draft(
+    topic: str = Form(..., description="The topic for the generated speech."),
+    time_limit_minutes: TimeLimit = Form(..., description="Desired length of the speech in minutes. Choose from the dropdown."),
+    tone: Tone = Form(Tone.informative, description="Tone for the speech. Choose from the dropdown.")
+):
+    # Validate selected time limit against allowed options (dropdown)
+    if float(time_limit_minutes.value) not in ALLOWED_TIME_LIMITS:
+        raise HTTPException(status_code=400, detail=f"Invalid time limit. Allowed values: {sorted(ALLOWED_TIME_LIMITS)}")
+    
+    # Use selected tone value (friendly label) from the Enum
+    tone_value = tone.value
+ 
+     # Approximate word count based on 150 WPM
+    minutes_value = float(time_limit_minutes.value)
+    estimated_word_count = int(round(minutes_value * 150))
+
+    client = analysis._get_gemini_client()
+    if client is None:
+        raise HTTPException(status_code=503, detail="Gemini API service is unavailable. Check configuration.")
+
+    system_instruction = (
+        "You are an expert speechwriter and presentation coach. Your task is to generate a professional, "
+        "compelling, and well-structured speech draft. The speech MUST be formatted with clear "
+        "Markdown headings for easy reading and practice. Ensure the content logically flows "
+        "through an Introduction, main Body points, and a powerful Conclusion."
+    )
+    
+    user_prompt = (
+        f"Generate a presentation draft on the following topic: '{topic}'. Use a '{tone_value}' tone for the voice and style. "
+        f"The speech must be structured and approximately {minutes_value} minutes long, "
+        f"which corresponds to about {estimated_word_count} words (assuming a moderate pace of 150 WPM). "
+        f"Format the output using Markdown with sections labeled: # Title, ## Introduction, ### Main Points (with bullet lists), and ## Conclusion."
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=analysis.GEMINI_MODEL,
+            contents=[user_prompt],
+            config=analysis.types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.7,
+                max_output_tokens=2048
+            )
+        )
+
+        generated_speech = response.text.strip()
+        return SpeechDraftResponse(
+            topic=topic,
+            time_limit_minutes=minutes_value,
+            estimated_word_count=estimated_word_count,
+            generated_speech_draft=generated_speech,
+            tone=tone_value
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM content generation failed: {e}")
+
+
+# --- ENDPOINT 3: /generate_ai_voiceover (Script & Audio Generation) ---
+@app.post("/generate_ai_voiceover", response_model=AIVoiceoverResponse, summary="Generates a full, professional script and saves the voiceover audio locally.")
+async def generate_ai_voiceover(
+    topic: str = Form(..., description="The topic for the voiceover presentation."),
+    time_limit_minutes: TimeLimit = Form(..., description="Desired length of the script in minutes. Choose from the dropdown.")
+):
+    if float(time_limit_minutes.value) not in ALLOWED_TIME_LIMITS:
+        raise HTTPException(status_code=400, detail=f"Invalid time limit. Allowed values: {sorted(ALLOWED_TIME_LIMITS)}")
+    
+    minutes_value = float(time_limit_minutes.value)
+    estimated_word_count = int(round(minutes_value * 150))
+
+    # 1. Generate the full, properly formatted script using Gemini
+    full_script = analysis.get_llm_presentation_script(topic, minutes_value)
+
+    if full_script.startswith("Script generation failed"):
+        raise HTTPException(status_code=500, detail=full_script)
+        
+    # 2. Generate Voiceover using pyttsx3
+    # friendly filename: use "30sec" label for 0.5 minutes
+    length_label = "30sec" if minutes_value == 0.5 else f"{int(minutes_value)}min"
+    output_filename = f"voiceover_{topic.replace(' ', '_').lower()}_{length_label}.wav"
+    
+    try:
+        engine = pyttsx3.init()
+        # Set properties (optional)
+        engine.setProperty("rate", 150) 
+        engine.setProperty("volume", 1.0) 
+
+        # Save the LLM generated script as WAV
+        engine.save_to_file(full_script, output_filename)
+        engine.runAndWait()
+        
+    except Exception as e:
+        # Catch TTS specific errors
+        raise HTTPException(status_code=500, detail=f"Text-to-Speech generation failed (pyttsx3 error): {e}")
+
+
+    # 3. Return the script and the filename
+    return AIVoiceoverResponse(
+        topic=topic,
+        time_limit_minutes=minutes_value,
+        estimated_word_count=estimated_word_count,
+        full_voiceover_script=full_script,
+        audio_file_saved_as=output_filename
+    )
+
+
+# --- NEW ENDPOINT 4: /presentation_content (Content, Outline, & Images) ---
+@app.post("/presentation_content", response_model=PresentationContentResponse, summary="Generates a full presentation outline, slide text, and visual suggestions.")
+async def presentation_content(
+    topic: str = Form(..., description="The topic for the presentation."),
+    time_limit_minutes: TimeLimit = Form(..., description="Desired length of the presentation in minutes. Choose from the dropdown.")
+):
+    if float(time_limit_minutes.value) not in ALLOWED_TIME_LIMITS:
+        raise HTTPException(status_code=400, detail=f"Invalid time limit. Allowed values: {sorted(ALLOWED_TIME_LIMITS)}")
+    
+    minutes_value = float(time_limit_minutes.value)
+    estimated_word_count = int(round(minutes_value * 150))
+
+    # 1. Generate the structured content using the new analysis function
+    slide_data = analysis.get_llm_presentation_content(topic, minutes_value)
+
+    if isinstance(slide_data, dict) and 'error' in slide_data:
+        raise HTTPException(status_code=500, detail=slide_data['error'])
+    
+    # Accept either:
+    #  - dict with keys: 'template_suggestion' (str) and 'slides' (list)
+    #  - or a plain list of slides
+    if isinstance(slide_data, dict) and 'slides' in slide_data:
+        template_suggestion = slide_data.get('template_suggestion', "")
+        slides_raw = slide_data['slides']
+    elif isinstance(slide_data, list):
+        template_suggestion = ""
+        slides_raw = slide_data
+    else:
+        raise HTTPException(status_code=500, detail=f"Unexpected LLM output format for presentation content. Raw: {slide_data}")
+    
+    # 2. Ensure the slide data matches the Pydantic model structure
+    try:
+        validated_slides = [PresentationSlide(**slide) for slide in slides_raw]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM output failed to match slide structure: {e}. Raw data: {slide_data}")
+
+    # 3. Return the full presentation content, including template suggestion
+    return PresentationContentResponse(
+        template_suggestion=template_suggestion,
+        topic=topic,
+        time_limit_minutes=minutes_value,
+        estimated_word_count=estimated_word_count,
+        slides=validated_slides
+    )
+
+# --- ENDPOINT 5: /check_redundancy (Script-Slide Overlap) ---
+@app.post("/check_redundancy", response_model=RedundancyAnalysisResponse, summary="Checks the speaker script against slide content for excessive redundancy.")
+async def check_redundancy(
+    script: str = Form(..., description="The full, intended speaker script/notes."),
+    slide_bullets: List[str] = Form(..., description="The list of bullet points or main texts intended for the slides.")
+):
+    
+    # 1. Generate redundancy analysis using the new analysis function
+    redundancy_data = analysis.analyze_script_redundancy(script, slide_bullets)
+
+    if 'error' in redundancy_data:
+        raise HTTPException(status_code=500, detail=redundancy_data['error'])
+    
+    score = redundancy_data.get("redundancy_score", 50)
+    
+    # 2. Generate actionable tip based on the score
+    if score < 20:
+        tip = "✅ Excellent separation! Your script elaborates well on your slides. Keep your slide text minimal."
+    elif score < 50:
+        tip = "⚠️ Moderate Redundancy. Review the flagged phrases and use different language in your script than what is visible on the slide."
+    else:
+        tip = "🛑 High Redundancy. You are likely reading directly from your slides. Your script should be complementary, not identical, to the visual content. Restructure your notes."
+
+    # 3. Return the structured content
+    return RedundancyAnalysisResponse(
+        redundancy_score=score,
+        analysis_tip=tip,
+        redundant_phrases_found=redundancy_data.get("redundant_phrases", []),
+        slide_content_provided=slide_bullets
+    )

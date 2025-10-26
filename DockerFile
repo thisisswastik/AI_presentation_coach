@@ -1,0 +1,20 @@
+# File Name: Dockerfile
+# Use a Python base image suitable for production
+FROM python:3.11-slim
+
+# Set the working directory in the container
+WORKDIR /app
+
+# Copy and install dependencies first to leverage Docker caching
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the rest of the application code
+COPY . .
+
+# Render automatically sets the PORT environment variable.
+# Uvicorn should bind to 0.0.0.0 and use the port provided by the environment.
+# Note: The Render default port is 10000, which is handled by the $PORT variable.
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "80"]
+# Note: Render will often override the port here to $PORT or 10000.
+# A simpler CMD ["uvicorn", "app:app", "--host", "0.0.0.0"] will also work on Render.
