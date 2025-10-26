@@ -3,6 +3,8 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 from io import BytesIO
+import whisper 
+import torch
 import pyttsx3 
 from enum import Enum
 
@@ -78,7 +80,7 @@ class PresentationSlide(BaseModel):
 class PresentationContentResponse(BaseModel):
     template_suggestion: str
     topic: str
-    time_limit_minutes: int
+    time_limit_minutes: float  # Changed from int to float
     estimated_word_count: int
     slides: List[PresentationSlide]
 
@@ -95,24 +97,15 @@ app = FastAPI(
     version="1.3.1" # Updated version number
 )
 
-class TimeLimit(Enum):
-    one_min = 1.0
-    two_min = 2.0
-    three_min = 3.0
-    four_min = 4.0
-    five_min = 5.0
-    thirty_seconds = 0.5   # 0.5 minutes == 30 seconds
+class TimeLimit(str, Enum):  # Change to str,Enum for better serialization
+    thirty_seconds = "0.5"
+    one_min = "1.0"
+    two_min = "2.0"
+    three_min = "3.0" 
+    four_min = "4.0"
+    five_min = "5.0"
 
 ALLOWED_TIME_LIMITS = {float(t.value) for t in TimeLimit}
-
-# Tone options for dropdown in the OpenAPI UI
-class Tone(Enum):
-    persuasive = "Persuasive / Convincing"
-    informative = "Informative / Educational"
-    motivational = "Motivational / Inspirational"
-    empathic = "Empathic / Customer-Facing"
-    formal = "Formal / Authoritative"
-    casual = "Casual / Conversational"
 
 def generate_core_feedback(overall_wpm, filler_count, total_words, tagged_list, acoustic_metrics, pause_metrics, vague_phrases, relevance_score, suggested_content):
     """Generates actionable feedback based on ALL metrics (Delivery & Content)."""
@@ -255,20 +248,22 @@ async def analyze_presentation(
 
 
 # --- ENDPOINT 2: /speech_draft (Draft Generation) ---
-@app.post("/speech_draft", response_model=SpeechDraftResponse, summary="Generates a professional speech draft based on topic and time limit.")
+@app.post("/speech_draft", response_model=SpeechDraftResponse, summary="Generates a professional speech draft based on topic and time limit (Max 5 mins).")
 async def speech_draft(
     topic: str = Form(..., description="The topic for the generated speech."),
     time_limit_minutes: TimeLimit = Form(..., description="Desired length of the speech in minutes. Choose from the dropdown."),
-    tone: Tone = Form(Tone.informative, description="Tone for the speech. Choose from the dropdown.")
+    tone: str = Form("professional", description="Tone for the speech: e.g., professional, casual, student")
 ):
     # Validate selected time limit against allowed options (dropdown)
     if float(time_limit_minutes.value) not in ALLOWED_TIME_LIMITS:
         raise HTTPException(status_code=400, detail=f"Invalid time limit. Allowed values: {sorted(ALLOWED_TIME_LIMITS)}")
     
-    # Use selected tone value (friendly label) from the Enum
-    tone_value = tone.value
+    allowed_tones = ["professional", "casual", "student", "formal", "friendly"]
+    tone = tone.strip().lower()
+    if tone not in allowed_tones:
+        raise HTTPException(status_code=400, detail=f"Invalid tone. Allowed tones: {', '.join(allowed_tones)}")
  
-     # Approximate word count based on 150 WPM
+    # Approximate word count based on 150 WPM
     minutes_value = float(time_limit_minutes.value)
     estimated_word_count = int(round(minutes_value * 150))
 
@@ -284,7 +279,7 @@ async def speech_draft(
     )
     
     user_prompt = (
-        f"Generate a presentation draft on the following topic: '{topic}'. Use a '{tone_value}' tone for the voice and style. "
+        f"Generate a presentation draft on the following topic: '{topic}'. Use a {tone} tone for the voice and style. "
         f"The speech must be structured and approximately {minutes_value} minutes long, "
         f"which corresponds to about {estimated_word_count} words (assuming a moderate pace of 150 WPM). "
         f"Format the output using Markdown with sections labeled: # Title, ## Introduction, ### Main Points (with bullet lists), and ## Conclusion."
@@ -307,7 +302,7 @@ async def speech_draft(
             time_limit_minutes=minutes_value,
             estimated_word_count=estimated_word_count,
             generated_speech_draft=generated_speech,
-            tone=tone_value
+            tone=tone
         )
 
     except Exception as e:
@@ -366,11 +361,9 @@ async def generate_ai_voiceover(
 @app.post("/presentation_content", response_model=PresentationContentResponse, summary="Generates a full presentation outline, slide text, and visual suggestions.")
 async def presentation_content(
     topic: str = Form(..., description="The topic for the presentation."),
-    time_limit_minutes: TimeLimit = Form(..., description="Desired length of the presentation in minutes. Choose from the dropdown.")
+    time_limit_minutes: TimeLimit = Form(..., description="Desired length of the presentation in minutes (0.5=30sec, 1-5 min)")
 ):
-    if float(time_limit_minutes.value) not in ALLOWED_TIME_LIMITS:
-        raise HTTPException(status_code=400, detail=f"Invalid time limit. Allowed values: {sorted(ALLOWED_TIME_LIMITS)}")
-    
+    # Convert string enum value to float for calculations
     minutes_value = float(time_limit_minutes.value)
     estimated_word_count = int(round(minutes_value * 150))
 
@@ -407,7 +400,7 @@ async def presentation_content(
         slides=validated_slides
     )
 
-# --- ENDPOINT 5: /check_redundancy (Script-Slide Overlap) ---
+# --- ENDPOINT 8: /check_redundancy (Script-Slide Overlap) ---
 @app.post("/check_redundancy", response_model=RedundancyAnalysisResponse, summary="Checks the speaker script against slide content for excessive redundancy.")
 async def check_redundancy(
     script: str = Form(..., description="The full, intended speaker script/notes."),
@@ -436,5 +429,4 @@ async def check_redundancy(
         analysis_tip=tip,
         redundant_phrases_found=redundancy_data.get("redundant_phrases", []),
         slide_content_provided=slide_bullets
-
     )
