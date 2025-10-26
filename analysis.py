@@ -115,26 +115,45 @@ def detect_fillers(word_list: List[Dict[str, Any]]):
     return word_list, filler_count
 
 
-def analyze_pacing(word_list: List[Dict[str, Any]], target_wpm=TARGET_WPM_RANGE, window_sec=WPM_WINDOW_SEC):
+def analyze_pacing(word_list: List[Dict[str, Any]], target_wpm=TARGET_WPM_RANGE):
     """Calculates overall and local WPM, tagging fast/slow segments."""
-    if not word_list: return word_list, 0.0, {}
+    if not word_list:
+        return word_list, 0.0, {}
 
     total_words = len(word_list)
-    total_time_sec = word_list[-1]["end"]
-    overall_wpm = (total_words / total_time_sec) * 60 if total_time_sec > 0 else 0.0
     
+    # Fix: Calculate total duration considering the duration of each word
+    total_duration = 0.0
+    for word in word_list:
+        total_duration += word.get('duration', 0)
+    
+    # Convert to minutes and calculate WPM
+    total_duration_minutes = total_duration / 60.0
+
+    # Prevent division by zero and unrealistic WPM
+    if total_duration_minutes <= 0:
+        return word_list, 150.0, {}  # Return average speaking rate
+        
+    overall_wpm = total_words / total_duration_minutes
+    
+    # Cap WPM to realistic range
+    overall_wpm = min(max(overall_wpm, 60), 300)
+    
+    # Calculate local pacing
     wpm_map = {}
     for i, word in enumerate(word_list):
-        window_start = word["start"] - window_sec / 2
-        window_end = word["start"] + window_sec / 2
+        window_start = word["start"] - WPM_WINDOW_SEC / 2
+        window_end = word["start"] + WPM_WINDOW_SEC / 2
         
         window_words = [w for w in word_list 
-                        if w["start"] >= window_start and w["end"] <= window_end]
+                       if w["start"] >= window_start and w["end"] <= window_end]
         
-        if len(window_words) < 5: continue
+        if len(window_words) < 5: 
+            continue
             
-        time_span = window_words[-1]["end"] - window_words[0]["start"]
-        local_wpm = (len(window_words) / time_span) * 60 if time_span > 0 else 0.0
+        # Calculate window duration using word durations
+        window_duration = sum(w.get('duration', 0) for w in window_words)
+        local_wpm = (len(window_words) / (window_duration / 60)) if window_duration > 0 else 0.0
         
         if local_wpm > target_wpm[1] * 1.1:
             word["tags"].append("fast_pacing")
