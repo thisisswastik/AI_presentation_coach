@@ -5,4 +5,5 @@ requests
 google-genai
 pydantic
 pyttsx3
+python-multipart
 cloudinary
