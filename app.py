@@ -3,8 +3,6 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 from io import BytesIO
-import whisper 
-import torch
 import pyttsx3 
 from enum import Enum
 
@@ -246,6 +244,7 @@ async def analyze_presentation(
             relevance_score=relevance_score,
             suggested_content=suggested_content,
             raw_transcription=raw_text,
+            feedback=feedback_list,
             transcript=word_list_data
         )
 
@@ -437,4 +436,5 @@ async def check_redundancy(
         analysis_tip=tip,
         redundant_phrases_found=redundancy_data.get("redundant_phrases", []),
         slide_content_provided=slide_bullets
+
     )
