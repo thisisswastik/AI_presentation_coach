@@ -3,8 +3,6 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 from io import BytesIO
-import whisper 
-import torch
 import pyttsx3 
 from enum import Enum
 
@@ -430,3 +428,4 @@ async def check_redundancy(
         redundant_phrases_found=redundancy_data.get("redundant_phrases", []),
         slide_content_provided=slide_bullets
     )
+
