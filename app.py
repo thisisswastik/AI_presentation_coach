@@ -3,6 +3,8 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 from io import BytesIO
+import whisper 
+import torch
 import pyttsx3 
 from enum import Enum
 import cloudinary
@@ -71,7 +73,7 @@ class SpeechDraftResponse(BaseModel):
     topic: str
     time_limit_minutes: float
     estimated_word_count: int
-    generated_speech_draft: str
+    generated_speech_draft: List[str]  # Changed from List[Dict[str, Any]] to List[str]
     # New: tone used for generation
     tone: str
     
@@ -367,12 +369,41 @@ async def speech_draft(
             )
         )
 
-        generated_speech = response.text.strip()
+        # Get the raw markdown text
+        raw_speech = response.text.strip()
+        
+        # Parse the markdown into a flat array
+        speech_parts = []
+        lines = raw_speech.strip().split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            if line.startswith('# '):  # Title
+                speech_parts.append(line[2:].strip())
+            
+            elif line.startswith('## '):  # Main sections
+                speech_parts.append(line[3:].strip())
+            
+            elif line.startswith('### '):  # Sub-sections
+                speech_parts.append(line[4:].strip())
+            
+            elif line.startswith('* ') or line.startswith('- '):  # Bullet points
+                point = line[2:].strip()
+                if point.startswith('**'):  # Handle bold text
+                    point = point[2:-2].strip()  # Remove ** markers
+                speech_parts.append(point)
+            
+            elif line:  # Regular text (non-empty)
+                speech_parts.append(line)
+
         return SpeechDraftResponse(
             topic=topic,
             time_limit_minutes=minutes_value,
             estimated_word_count=estimated_word_count,
-            generated_speech_draft=generated_speech,
+            generated_speech_draft=speech_parts,  # Now it's a simple array of strings
             tone=tone
         )
 
