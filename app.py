@@ -102,6 +102,23 @@ class RedundancyAnalysisResponse(BaseModel):
     redundant_phrases_found: List[str] = Field(..., description="Specific phrases from the script that overlap with slide content.")
     slide_content_provided: List[str]
     
+# Add these models after your existing models
+class AnalysisFeedback(BaseModel):
+    clarity_score: int
+    overall_wpm: float
+    filler_count: int
+    filler_words_used: List[str]
+    feedback: List[str]
+    vague_phrases_found: List[str]
+
+class OverallFeedbackResponse(BaseModel):
+    total_sessions: int
+    performance_summary: str
+    improvement_areas: List[str]
+    strengths: List[str]
+    action_items: List[str]
+    filler_word_analysis: Dict[str, Any]
+
 # --- FastAPI Initialization (CRITICAL: Must be defined as 'app') ---
 app = FastAPI(
     title="Presentation Coach API",
@@ -497,3 +514,100 @@ async def check_redundancy(
         redundant_phrases_found=redundancy_data.get("redundant_phrases", []),
         slide_content_provided=slide_bullets
     )
+
+@app.post("/overall_feedback", response_model=OverallFeedbackResponse)
+async def overall_feedback(
+    feedbacks: List[AnalysisFeedback],
+    minimum_sessions: int = Form(2, description="Minimum number of sessions required for analysis")
+):
+    if len(feedbacks) < minimum_sessions:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Need at least {minimum_sessions} sessions for meaningful analysis. Received {len(feedbacks)}"
+        )
+
+    try:
+        # Prepare data for Gemini
+        feedback_summary = {
+            "metrics": {
+                "avg_clarity": sum(f.clarity_score for f in feedbacks) / len(feedbacks),
+                "avg_wpm": sum(f.overall_wpm for f in feedbacks) / len(feedbacks),
+                "total_fillers": sum(f.filler_count for f in feedbacks),
+            },
+            "all_feedback": [item for f in feedbacks for item in f.feedback],
+            "all_fillers": [word for f in feedbacks for word in f.filler_words_used],
+            "all_vague_phrases": [phrase for f in feedbacks for phrase in f.vague_phrases_found]
+        }
+
+        client = analysis._get_gemini_client()
+        if client is None:
+            raise HTTPException(status_code=503, detail="Gemini API service is unavailable")
+
+        system_instruction = """
+        You are an expert speech coach analyzing multiple presentation sessions.
+        Provide a comprehensive analysis focusing on:
+        1. Overall performance trends
+        2. Specific areas needing improvement
+        3. Notable strengths
+        4. Actionable recommendations
+        Format the response as JSON with these exact keys:
+        {
+            "performance_summary": "overall analysis",
+            "improvement_areas": ["area1", "area2"...],
+            "strengths": ["strength1", "strength2"...],
+            "action_items": ["action1", "action2"...]
+        }
+        """
+
+        prompt = f"""
+        Analyze these presentation sessions:
+        - Average Clarity Score: {feedback_summary['metrics']['avg_clarity']}/100
+        - Average WPM: {feedback_summary['metrics']['avg_wpm']}
+        - Total Filler Words: {feedback_summary['metrics']['total_fillers']}
+        
+        Common Feedback Points:
+        {feedback_summary['all_feedback']}
+        
+        Frequently Used Filler Words:
+        {feedback_summary['all_fillers']}
+        
+        Vague Phrases Used:
+        {feedback_summary['all_vague_phrases']}
+        
+        Provide a structured analysis as JSON focusing on patterns, improvements needed, and specific recommendations.
+        """
+
+        response = client.models.generate_content(
+            model=analysis.GEMINI_MODEL,
+            contents=[prompt],
+            config=analysis.types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.7,
+                response_format="json"
+            )
+        )
+
+        analysis_result = response.json()
+        
+        # Calculate filler word frequencies
+        from collections import Counter
+        filler_analysis = {
+            "most_common": Counter(feedback_summary['all_fillers']).most_common(5),
+            "total_count": len(feedback_summary['all_fillers']),
+            "unique_count": len(set(feedback_summary['all_fillers']))
+        }
+
+        return OverallFeedbackResponse(
+            total_sessions=len(feedbacks),
+            performance_summary=analysis_result["performance_summary"],
+            improvement_areas=analysis_result["improvement_areas"],
+            strengths=analysis_result["strengths"],
+            action_items=analysis_result["action_items"],
+            filler_word_analysis=filler_analysis
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to generate overall feedback: {str(e)}"
+        )
