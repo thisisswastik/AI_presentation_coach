@@ -5,6 +5,10 @@ from pydantic import BaseModel, Field
 from io import BytesIO
 import pyttsx3 
 from enum import Enum
+import cloudinary
+import cloudinary.uploader
+import os
+from dotenv import load_dotenv
 
 # IMPORT FIX: Explicitly import the analysis module to allow access to its globals (analysis.client)
 import analysis
@@ -14,6 +18,16 @@ from analysis import (
     analyze_vague_language, analyze_topic_relevance, analyze_pauses, 
     simulate_acoustic_metrics, TARGET_WPM_RANGE,_get_gemini_client,
     get_llm_presentation_script, get_llm_presentation_content, analyze_script_redundancy # <--- NEW IMPORT
+)
+
+# Load environment variables
+load_dotenv()
+
+# Configure Cloudinary with environment variables
+cloudinary.config( 
+    cloud_name = os.getenv('CLOUDINARY_CLOUD_NAME'),
+    api_key = os.getenv('CLOUDINARY_API_KEY'),
+    api_secret = os.getenv('CLOUDINARY_API_SECRET')
 )
 
 # --- Pydantic Response Models ---
@@ -33,6 +47,7 @@ class FullEvaluationResponse(BaseModel):
     clarity_score: int
     overall_wpm: float
     filler_count: int
+    filler_words_used: List[str] = Field(default_factory=list, description="The actual filler words found in the speech")  # Add this line
     strategic_pauses: int
     hesitation_gaps: int
     acoustic_metrics: AcousticMetrics
@@ -66,8 +81,7 @@ class AIVoiceoverResponse(BaseModel):
     time_limit_minutes: float
     estimated_word_count: int
     full_voiceover_script: str
-    # New field to confirm audio generation
-    audio_file_saved_as: str 
+    audio_file_url: str  # Changed from audio_file_saved_as to audio_file_url
     
 # NEW MODEL 3: For the presentation content endpoint
 class PresentationSlide(BaseModel):
@@ -225,6 +239,14 @@ async def analyze_presentation(
         total_words = len(word_list_data)
 
         word_list_data, filler_count = analysis.detect_fillers(word_list_data)
+        
+        # After word_list_data, filler_count = analysis.detect_fillers(word_list_data)
+        # Add this code to extract actual filler words:
+        actual_fillers = []
+        for word in word_list_data:
+            if "filler" in word.get("tags", []):
+                actual_fillers.append(word["text"])
+        
         word_list_data, overall_wpm, wpm_map = analysis.analyze_pacing(word_list_data)
         word_list_data, strategic_pauses, hesitation_gaps = analysis.analyze_pauses(word_list_data)
         vague_phrases = analysis.analyze_vague_language(raw_text)
@@ -254,6 +276,7 @@ async def analyze_presentation(
             clarity_score=clarity_score,
             overall_wpm=round(overall_wpm, 1),
             filler_count=filler_count,
+            filler_words_used=actual_fillers,  # Add this line
             strategic_pauses=strategic_pauses,
             hesitation_gaps=hesitation_gaps,
             vague_phrases_found=vague_phrases,
@@ -344,40 +367,61 @@ async def generate_ai_voiceover(
     minutes_value = float(time_limit_minutes.value)
     estimated_word_count = int(round(minutes_value * 150))
 
-    # 1. Generate the full, properly formatted script using Gemini
+    # 1. Generate the script
     full_script = analysis.get_llm_presentation_script(topic, minutes_value)
 
     if full_script.startswith("Script generation failed"):
         raise HTTPException(status_code=500, detail=full_script)
         
-    # 2. Generate Voiceover using pyttsx3
-    # friendly filename: use "30sec" label for 0.5 minutes
-    length_label = "30sec" if minutes_value == 0.5 else f"{int(minutes_value)}min"
-    output_filename = f"voiceover_{topic.replace(' ', '_').lower()}_{length_label}.wav"
-    
     try:
-        engine = pyttsx3.init()
-        # Set properties (optional)
-        engine.setProperty("rate", 150) 
-        engine.setProperty("volume", 1.0) 
-
-        # Save the LLM generated script as WAV
-        engine.save_to_file(full_script, output_filename)
-        engine.runAndWait()
+        # 2. Generate temporary WAV file
+        length_label = "30sec" if minutes_value == 0.5 else f"{int(minutes_value)}min"
+        temp_filename = f"temp_voiceover_{topic.replace(' ', '_').lower()}_{length_label}.wav"
         
+        engine = pyttsx3.init()
+        engine.setProperty("rate", 150)
+        engine.setProperty("volume", 1.0)
+        engine.save_to_file(full_script, temp_filename)
+        engine.runAndWait()
+
+        # 3. Upload to Cloudinary
+        try:
+            if not os.getenv('CLOUDINARY_CLOUD_NAME'):
+                raise HTTPException(status_code=500, detail="Cloudinary configuration missing. Check environment variables.")
+
+            upload_result = cloudinary.uploader.upload(
+                temp_filename,
+                resource_type="raw",
+                folder="presentation_audio",
+                public_id=f"voiceover_{topic.replace(' ', '_').lower()}_{length_label}",
+                overwrite=True
+            )
+            
+            audio_url = upload_result.get('secure_url')
+            if not audio_url:
+                raise HTTPException(status_code=500, detail="Failed to get URL from Cloudinary upload")
+
+        except Exception as cloud_err:
+            raise HTTPException(status_code=500, detail=f"Cloudinary upload failed: {str(cloud_err)}")
+        finally:
+            # Clean up temporary file
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+
+        # 4. Return response with Cloudinary URL
+        return AIVoiceoverResponse(
+            topic=topic,
+            time_limit_minutes=minutes_value,
+            estimated_word_count=estimated_word_count,
+            full_voiceover_script=full_script,
+            audio_file_url=audio_url
+        )
+
     except Exception as e:
-        # Catch TTS specific errors
-        raise HTTPException(status_code=500, detail=f"Text-to-Speech generation failed (pyttsx3 error): {e}")
-
-
-    # 3. Return the script and the filename
-    return AIVoiceoverResponse(
-        topic=topic,
-        time_limit_minutes=minutes_value,
-        estimated_word_count=estimated_word_count,
-        full_voiceover_script=full_script,
-        audio_file_saved_as=output_filename
-    )
+        # Clean up temp file in case of any error
+        if 'temp_filename' in locals() and os.path.exists(temp_filename):
+            os.remove(temp_filename)
+        raise HTTPException(status_code=500, detail=f"Voiceover generation failed: {str(e)}")
 
 
 # --- NEW ENDPOINT 4: /presentation_content (Content, Outline, & Images) ---
