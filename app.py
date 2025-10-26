@@ -3,8 +3,6 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 from io import BytesIO
-import whisper 
-import torch
 import pyttsx3 
 from enum import Enum
 import cloudinary
@@ -668,3 +666,4 @@ async def overall_feedback(
             status_code=500, 
             detail=f"Failed to generate overall feedback: {str(e)}"
         )
+
