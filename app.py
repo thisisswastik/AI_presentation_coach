@@ -1,5 +1,5 @@
 import requests
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 from io import BytesIO
@@ -211,40 +211,48 @@ def generate_core_feedback(overall_wpm, filler_count, total_words, tagged_list, 
 
 
 # --- ENDPOINT 1 (MERGED): /analyze (Full Delivery and Content Analysis) ---
-@app.post("/analyze", response_model=FullEvaluationResponse, summary="Performs full analysis: Pacing, Fillers, Clarity, and (optionally) Topic Relevance.")
+@app.post("/analyze", response_model=FullEvaluationResponse)
 async def analyze_presentation(
-    # NOTE: Making the direct file upload optional
-    audio_file: Optional[UploadFile] = File(None, description="Audio file (WAV format recommended)."),
-    # NEW: Accept audio URL as a Form field
-    audio_url: Optional[str] = Form(None, description="Optional: Direct URL to an external audio file (e.g., WAV)."),
-    topic: Optional[str] = Form(None, description="Optional: Topic for content relevance check.")
+    audio_file: Optional[UploadFile] = File(None),  # Changed to File(None)
+    audio_url: Optional[str] = Form(None, description="URL to audio file (WAV format)"),
+    topic: Optional[str] = Form(None, description="Optional topic for content relevance check")
 ):
-    
     audio_bytes = None
 
-    # --- 1. Audio Data Handling Logic (NEW) ---
-    if audio_url:
-        if audio_file:
-            raise HTTPException(status_code=400, detail="Provide either 'audio_file' or 'audio_url', but not both.")
-        
-        try:
-            # Download the audio file from the URL
-            response = requests.get(audio_url, timeout=10)
-            response.raise_for_status() # Raise an error for bad status codes (4xx or 5xx)
-            audio_bytes = response.content
-        except requests.exceptions.RequestException as e:
-            raise HTTPException(status_code=400, detail=f"Failed to download audio from URL: {e}")
-        
-    elif audio_file:
-        # Existing logic for file upload
-        audio_bytes = await audio_file.read()
-
-    else:
-        raise HTTPException(status_code=400, detail="Must provide either an 'audio_file' or an 'audio_url'.")
-    # --- END Audio Data Handling Logic ---
-
+    # Input validation
+    if not audio_file and not audio_url:
+        raise HTTPException(
+            status_code=400, 
+            detail="Must provide either an audio file upload or a valid audio URL"
+        )
     
+    if audio_file and audio_url:
+        raise HTTPException(
+            status_code=400, 
+            detail="Please provide either an audio file OR an audio URL, not both"
+        )
+
     try:
+        if audio_url:
+            # Handle URL input
+            try:
+                response = requests.get(audio_url, timeout=10)
+                response.raise_for_status()
+                audio_bytes = response.content
+            except requests.exceptions.RequestException as e:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Failed to download audio from URL: {str(e)}"
+                )
+        elif audio_file:
+            # Handle file upload
+            audio_bytes = await audio_file.read()
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="No audio source provided"
+            )
+
         # 1. Transcription
         # Use the audio_bytes regardless of whether it came from a file upload or a URL download
         raw_text = analysis.call_whisper_api(audio_bytes) 
