@@ -442,47 +442,65 @@ async def generate_ai_voiceover(
 
 
 # --- NEW ENDPOINT 4: /presentation_content (Content, Outline, & Images) ---
-@app.post("/presentation_content", response_model=PresentationContentResponse, summary="Generates a full presentation outline, slide text, and visual suggestions.")
+@app.post("/presentation_content", response_model=PresentationContentResponse)
 async def presentation_content(
     topic: str = Form(..., description="The topic for the presentation."),
     time_limit_minutes: TimeLimit = Form(..., description="Desired length of the presentation in minutes (0.5=30sec, 1-5 min)")
 ):
-    # Convert string enum value to float for calculations
-    minutes_value = float(time_limit_minutes.value)
-    estimated_word_count = int(round(minutes_value * 150))
-
-    # 1. Generate the structured content using the new analysis function
-    slide_data = analysis.get_llm_presentation_content(topic, minutes_value)
-
-    if isinstance(slide_data, dict) and 'error' in slide_data:
-        raise HTTPException(status_code=500, detail=slide_data['error'])
-    
-    # Accept either:
-    #  - dict with keys: 'template_suggestion' (str) and 'slides' (list)
-    #  - or a plain list of slides
-    if isinstance(slide_data, dict) and 'slides' in slide_data:
-        template_suggestion = slide_data.get('template_suggestion', "")
-        slides_raw = slide_data['slides']
-    elif isinstance(slide_data, list):
-        template_suggestion = ""
-        slides_raw = slide_data
-    else:
-        raise HTTPException(status_code=500, detail=f"Unexpected LLM output format for presentation content. Raw: {slide_data}")
-    
-    # 2. Ensure the slide data matches the Pydantic model structure
     try:
-        validated_slides = [PresentationSlide(**slide) for slide in slides_raw]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM output failed to match slide structure: {e}. Raw data: {slide_data}")
+        # Convert string enum value to float for calculations
+        minutes_value = float(time_limit_minutes.value)
+        estimated_word_count = int(round(minutes_value * 150))
 
-    # 3. Return the full presentation content, including template suggestion
-    return PresentationContentResponse(
-        template_suggestion=template_suggestion,
-        topic=topic,
-        time_limit_minutes=minutes_value,
-        estimated_word_count=estimated_word_count,
-        slides=validated_slides
-    )
+        # Check if Gemini client is available
+        client = analysis._get_gemini_client()
+        if client is None:
+            raise HTTPException(status_code=503, detail="Gemini API service is unavailable")
+
+        # 1. Generate the structured content
+        slide_data = analysis.get_llm_presentation_content(topic, minutes_value)
+        
+        if slide_data is None:
+            raise HTTPException(status_code=500, detail="Failed to generate presentation content")
+
+        if isinstance(slide_data, dict) and 'error' in slide_data:
+            raise HTTPException(status_code=500, detail=slide_data['error'])
+        
+        # Handle response format
+        if isinstance(slide_data, dict) and 'slides' in slide_data:
+            template_suggestion = slide_data.get('template_suggestion', "")
+            slides_raw = slide_data['slides']
+        elif isinstance(slide_data, list):
+            template_suggestion = ""
+            slides_raw = slide_data
+        else:
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Unexpected presentation content format. Got type: {type(slide_data)}"
+            )
+        
+        # Validate slide structure
+        try:
+            validated_slides = [PresentationSlide(**slide) for slide in slides_raw]
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Invalid slide structure: {str(e)}"
+            )
+
+        return PresentationContentResponse(
+            template_suggestion=template_suggestion,
+            topic=topic,
+            time_limit_minutes=minutes_value,
+            estimated_word_count=estimated_word_count,
+            slides=validated_slides
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Presentation content generation failed: {str(e)}"
+        )
 
 # --- ENDPOINT 8: /check_redundancy (Script-Slide Overlap) ---
 @app.post("/check_redundancy", response_model=RedundancyAnalysisResponse, summary="Checks the speaker script against slide content for excessive redundancy.")
