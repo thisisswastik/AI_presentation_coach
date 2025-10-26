@@ -182,19 +182,45 @@ def generate_core_feedback(overall_wpm, filler_count, total_words, tagged_list, 
 # --- ENDPOINT 1 (MERGED): /analyze (Full Delivery and Content Analysis) ---
 @app.post("/analyze", response_model=FullEvaluationResponse, summary="Performs full analysis: Pacing, Fillers, Clarity, and (optionally) Topic Relevance.")
 async def analyze_presentation(
-    audio_file: UploadFile = File(..., description="Audio file (WAV format recommended)."),
+    # NOTE: Making the direct file upload optional
+    audio_file: Optional[UploadFile] = File(None, description="Audio file (WAV format recommended)."),
+    # NEW: Accept audio URL as a Form field
+    audio_url: Optional[str] = Form(None, description="Optional: Direct URL to an external audio file (e.g., WAV)."),
     topic: Optional[str] = Form(None, description="Optional: Topic for content relevance check.")
 ):
     
-    try:
-        audio_bytes = await audio_file.read()
+    audio_bytes = None
+
+    # --- 1. Audio Data Handling Logic (NEW) ---
+    if audio_url:
+        if audio_file:
+            raise HTTPException(status_code=400, detail="Provide either 'audio_file' or 'audio_url', but not both.")
         
+        try:
+            # Download the audio file from the URL
+            response = requests.get(audio_url, timeout=10)
+            response.raise_for_status() # Raise an error for bad status codes (4xx or 5xx)
+            audio_bytes = response.content
+        except requests.exceptions.RequestException as e:
+            raise HTTPException(status_code=400, detail=f"Failed to download audio from URL: {e}")
+        
+    elif audio_file:
+        # Existing logic for file upload
+        audio_bytes = await audio_file.read()
+
+    else:
+        raise HTTPException(status_code=400, detail="Must provide either an 'audio_file' or an 'audio_url'.")
+    # --- END Audio Data Handling Logic ---
+
+    
+    try:
         # 1. Transcription
-        raw_text = call_whisper_api(audio_bytes)
+        # Use the audio_bytes regardless of whether it came from a file upload or a URL download
+        raw_text = analysis.call_whisper_api(audio_bytes) 
         if not raw_text:
             raise HTTPException(status_code=400, detail="Transcription failed to produce text.")
         
-        # 2. Core Analysis Pipeline
+        # 2. Core Analysis Pipeline (Remains the same)
         word_list_data = analysis._simulate_whisper_output(raw_text)
         total_words = len(word_list_data)
 
@@ -243,7 +269,6 @@ async def analyze_presentation(
         raise HTTPException(status_code=e.response.status_code, detail=f"Whisper API error: {e.response.text}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal Server Error during analysis: {e}")
-
 
 # --- ENDPOINT 2: /speech_draft (Draft Generation) ---
 @app.post("/speech_draft", response_model=SpeechDraftResponse, summary="Generates a professional speech draft based on topic and time limit (Max 5 mins).")
@@ -428,4 +453,3 @@ async def check_redundancy(
         redundant_phrases_found=redundancy_data.get("redundant_phrases", []),
         slide_content_provided=slide_bullets
     )
-
