@@ -3,6 +3,8 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 from io import BytesIO
+import whisper 
+import torch
 import pyttsx3 
 from enum import Enum
 import cloudinary
@@ -435,10 +437,13 @@ async def generate_ai_voiceover(
             
             # Initialize engine with specific driver
             try:
-                engine = pyttsx3.init(driverName='espeak')
-            except:
-                # Fallback to default initialization
                 engine = pyttsx3.init()
+                voices = engine.getProperty('voices')
+                if voices:
+                    engine.setProperty('voice', voices[0].id)  # Use first available voice
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Voice engine init failed: {e}")
+
             
             # Configure basic properties first
             engine.setProperty('rate', 150)
