@@ -3,6 +3,8 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 from io import BytesIO
+import whisper 
+import torch
 import pyttsx3 
 from enum import Enum
 import cloudinary
@@ -410,71 +412,101 @@ async def speech_draft(
 
 
 # --- ENDPOINT 3: /generate_ai_voiceover (Script & Audio Generation) ---
-@app.post("/generate_ai_voiceover", response_model=AIVoiceoverResponse, summary="Generates a full, professional script and saves the voiceover audio locally.")
+@app.post("/generate_ai_voiceover", response_model=AIVoiceoverResponse)
 async def generate_ai_voiceover(
     topic: str = Form(..., description="The topic for the voiceover presentation."),
-    time_limit_minutes: TimeLimit = Form(..., description="Desired length of the script in minutes. Choose from the dropdown.")
+    time_limit_minutes: TimeLimit = Form(..., description="Desired length of the script in minutes.")
 ):
-    if float(time_limit_minutes.value) not in ALLOWED_TIME_LIMITS:
-        raise HTTPException(status_code=400, detail=f"Invalid time limit. Allowed values: {sorted(ALLOWED_TIME_LIMITS)}")
-    
-    minutes_value = float(time_limit_minutes.value)
-    estimated_word_count = int(round(minutes_value * 150))
-
-    # 1. Generate the script
-    full_script = analysis.get_llm_presentation_script(topic, minutes_value)
-
-    if full_script.startswith("Script generation failed"):
-        raise HTTPException(status_code=500, detail=full_script)
-        
     try:
-        # 2. Generate temporary WAV file
-        length_label = "30sec" if minutes_value == 0.5 else f"{int(minutes_value)}min"
-        temp_filename = f"temp_voiceover_{topic.replace(' ', '_').lower()}_{length_label}.wav"
-        
-        engine = pyttsx3.init()
-        engine.setProperty("rate", 150)
-        engine.setProperty("volume", 1.0)
-        engine.save_to_file(full_script, temp_filename)
-        engine.runAndWait()
+        minutes_value = float(time_limit_minutes.value)
+        estimated_word_count = int(round(minutes_value * 150))
 
-        # 3. Upload to Cloudinary
+        # 1. Generate the script
+        full_script = analysis.get_llm_presentation_script(topic, minutes_value)
+
+        if full_script.startswith("Script generation failed"):
+            raise HTTPException(status_code=500, detail=full_script)
+            
         try:
-            if not os.getenv('CLOUDINARY_CLOUD_NAME'):
-                raise HTTPException(status_code=500, detail="Cloudinary configuration missing. Check environment variables.")
-
-            upload_result = cloudinary.uploader.upload(
-                temp_filename,
-                resource_type="raw",
-                folder="presentation_audio",
-                public_id=f"voiceover_{topic.replace(' ', '_').lower()}_{length_label}",
-                overwrite=True
+            # 2. Generate temporary WAV file with robust error handling
+            length_label = "30sec" if minutes_value == 0.5 else f"{int(minutes_value)}min"
+            temp_filename = os.path.join(
+                os.getenv('TEMP_AUDIO_PATH', '/app/temp_audio'),
+                f"temp_voiceover_{topic.replace(' ', '_').lower()}_{length_label}.wav"
             )
             
-            audio_url = upload_result.get('secure_url')
-            if not audio_url:
-                raise HTTPException(status_code=500, detail="Failed to get URL from Cloudinary upload")
+            engine = pyttsx3.init()
+            
+            # Try to set a specific voice if available
+            voices = engine.getProperty('voices')
+            if voices:
+                # Try to find an English voice
+                english_voices = [v for v in voices if 'en' in v.languages]
+                if english_voices:
+                    engine.setProperty('voice', english_voices[0].id)
+                else:
+                    # If no English voice found, use the first available voice
+                    engine.setProperty('voice', voices[0].id)
+            
+            # Configure speech properties
+            engine.setProperty('rate', 150)    # Speaking rate
+            engine.setProperty('volume', 1.0)  # Volume level
+            
+            # Save to file with error checking
+            try:
+                engine.save_to_file(full_script, temp_filename)
+                engine.runAndWait()
+                
+                if not os.path.exists(temp_filename) or os.path.getsize(temp_filename) == 0:
+                    raise Exception("Failed to generate audio file")
+                
+            except Exception as voice_err:
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"Voice generation failed: {str(voice_err)}"
+                )
 
-        except Exception as cloud_err:
-            raise HTTPException(status_code=500, detail=f"Cloudinary upload failed: {str(cloud_err)}")
-        finally:
-            # Clean up temporary file
-            if os.path.exists(temp_filename):
+            # 3. Upload to Cloudinary with error handling
+            try:
+                if not os.getenv('CLOUDINARY_CLOUD_NAME'):
+                    raise HTTPException(status_code=500, detail="Cloudinary configuration missing")
+
+                upload_result = cloudinary.uploader.upload(
+                    temp_filename,
+                    resource_type="raw",
+                    folder="presentation_audio",
+                    public_id=f"voiceover_{topic.replace(' ', '_').lower()}_{length_label}",
+                    overwrite=True
+                )
+                
+                audio_url = upload_result.get('secure_url')
+                if not audio_url:
+                    raise HTTPException(status_code=500, detail="Failed to get URL from Cloudinary upload")
+
+            except Exception as cloud_err:
+                raise HTTPException(status_code=500, detail=f"Cloudinary upload failed: {str(cloud_err)}")
+            
+            finally:
+                # Clean up temporary file
+                if os.path.exists(temp_filename):
+                    os.remove(temp_filename)
+
+            # 4. Return response with Cloudinary URL
+            return AIVoiceoverResponse(
+                topic=topic,
+                time_limit_minutes=minutes_value,
+                estimated_word_count=estimated_word_count,
+                full_voiceover_script=full_script,
+                audio_file_url=audio_url
+            )
+
+        except Exception as e:
+            # Clean up temp file in case of any error
+            if 'temp_filename' in locals() and os.path.exists(temp_filename):
                 os.remove(temp_filename)
-
-        # 4. Return response with Cloudinary URL
-        return AIVoiceoverResponse(
-            topic=topic,
-            time_limit_minutes=minutes_value,
-            estimated_word_count=estimated_word_count,
-            full_voiceover_script=full_script,
-            audio_file_url=audio_url
-        )
+            raise HTTPException(status_code=500, detail=f"Voice generation failed: {str(e)}")
 
     except Exception as e:
-        # Clean up temp file in case of any error
-        if 'temp_filename' in locals() and os.path.exists(temp_filename):
-            os.remove(temp_filename)
         raise HTTPException(status_code=500, detail=f"Voiceover generation failed: {str(e)}")
 
 
@@ -570,18 +602,29 @@ async def check_redundancy(
         slide_content_provided=slide_bullets
     )
 
+# First, update the models
+class FeedbackInput(BaseModel):
+    clarity_score: int
+    overall_wpm: float
+    filler_count: int
+    filler_words_used: List[str]
+    feedback: List[str]
+    vague_phrases_found: List[str]
+
+class OverallFeedbackRequest(BaseModel):
+    feedbacks: List[FeedbackInput]
+
 @app.post("/overall_feedback", response_model=OverallFeedbackResponse)
 async def overall_feedback(
-    feedbacks: List[AnalysisFeedback],
-    minimum_sessions: int = Form(2, description="Minimum number of sessions required for analysis")
+    feedbacks: List[FeedbackInput] = Body(..., embed=True)  # Changed this line
 ):
-    if len(feedbacks) < minimum_sessions:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Need at least {minimum_sessions} sessions for meaningful analysis. Received {len(feedbacks)}"
-        )
-
     try:
+        if len(feedbacks) < 2:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Need at least 2 sessions for meaningful analysis. Received {len(feedbacks)}"
+            )
+        
         # Prepare data for Gemini
         feedback_summary = {
             "metrics": {
@@ -666,4 +709,3 @@ async def overall_feedback(
             status_code=500, 
             detail=f"Failed to generate overall feedback: {str(e)}"
         )
-
