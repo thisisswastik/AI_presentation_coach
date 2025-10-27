@@ -3,6 +3,8 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 from io import BytesIO
+import whisper 
+import torch
 import pyttsx3 
 from enum import Enum
 import cloudinary
@@ -433,22 +435,34 @@ async def generate_ai_voiceover(
                 f"temp_voiceover_{topic.replace(' ', '_').lower()}_{length_label}.wav"
             )
             
-            engine = pyttsx3.init()
+            # Initialize engine with specific driver
+            try:
+                engine = pyttsx3.init(driverName='espeak')
+            except:
+                # Fallback to default initialization
+                engine = pyttsx3.init()
             
-            # Try to set a specific voice if available
-            voices = engine.getProperty('voices')
-            if voices:
-                # Try to find an English voice
-                english_voices = [v for v in voices if 'en' in v.languages]
-                if english_voices:
-                    engine.setProperty('voice', english_voices[0].id)
-                else:
-                    # If no English voice found, use the first available voice
-                    engine.setProperty('voice', voices[0].id)
+            # Configure basic properties first
+            engine.setProperty('rate', 150)
+            engine.setProperty('volume', 1.0)
             
-            # Configure speech properties
-            engine.setProperty('rate', 150)    # Speaking rate
-            engine.setProperty('volume', 1.0)  # Volume level
+            # Careful voice selection
+            try:
+                voices = engine.getProperty('voices')
+                if voices:
+                    # Try each voice until one works
+                    for voice in voices:
+                        try:
+                            engine.setProperty('voice', voice.id)
+                            # Test if voice works
+                            engine.say("Test")
+                            engine.runAndWait()
+                            break
+                        except:
+                            continue
+            except Exception as voice_err:
+                print(f"Voice selection failed: {str(voice_err)}")
+                # Continue with default voice
             
             # Save to file with error checking
             try:
@@ -458,10 +472,10 @@ async def generate_ai_voiceover(
                 if not os.path.exists(temp_filename) or os.path.getsize(temp_filename) == 0:
                     raise Exception("Failed to generate audio file")
                 
-            except Exception as voice_err:
+            except Exception as save_err:
                 raise HTTPException(
                     status_code=500, 
-                    detail=f"Voice generation failed: {str(voice_err)}"
+                    detail=f"Audio file generation failed: {str(save_err)}"
                 )
 
             # 3. Upload to Cloudinary with error handling
@@ -707,4 +721,3 @@ async def overall_feedback(
             status_code=500, 
             detail=f"Failed to generate overall feedback: {str(e)}"
         )
-
