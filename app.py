@@ -444,25 +444,6 @@ async def generate_ai_voiceover(
             engine.setProperty('rate', 150)
             engine.setProperty('volume', 1.0)
             
-            # Careful voice selection
-            try:
-                voices = engine.getProperty('voices')
-                if voices:
-                    # Try each voice until one works
-                    for voice in voices:
-                        try:
-                            engine.setProperty('voice', voice.id)
-                            # Test if voice works
-                            engine.say("Test")
-                            engine.runAndWait()
-                            break
-                        except:
-                            continue
-            except Exception as voice_err:
-                print(f"Voice selection failed: {str(voice_err)}")
-                # Continue with default voice
-            
-            # Save to file with error checking
             try:
                 engine.save_to_file(full_script, temp_filename)
                 engine.runAndWait()
@@ -719,4 +700,3 @@ async def overall_feedback(
             status_code=500, 
             detail=f"Failed to generate overall feedback: {str(e)}"
         )
-
